@@ -179,3 +179,4 @@ results/finalTests/perplexity_outliersRemoved.csv
 results/finalTests/perplexity_outliersRemoved.json
 batch_perplexity_download.sh
 batch_ppl_download.sh
+main.py

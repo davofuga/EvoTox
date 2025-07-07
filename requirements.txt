@@ -51,7 +51,7 @@ python-dotenv==1.0.1
 pytz==2024.1
 PyYAML==6.0.1
 regex==2024.9.11
-requests==2.31.0
+requests
 safetensors==0.4.5
 sentencepiece==0.2.0
 setuptools==68.2.2
@@ -62,8 +62,8 @@ tdqm==0.0.1
 tokenizers==0.20.0
 torch==2.4.1
 tornado==6.4
-tqdm==4.66.2
-transformers==4.45.2
+tqdm
+transformers
 triton==3.0.0
 typing_extensions==4.12.2
 tzdata==2024.1
@@ -73,6 +73,8 @@ xyzservices==2024.4.0
 yarl==1.9.4
 joblib==1.4.2
 torchmetrics==1.6.0
-datasets==3.1.0
+datasets
 nltk==3.9.1
 textstat==0.7.4
+dataclass_wizard
+kenlm
