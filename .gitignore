@@ -152,6 +152,11 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# LLM / KenLM files for EvoTox
+kenlm/
+ngrams/
+output_ngram_training.txt
+
 
 # Additional entries
 
