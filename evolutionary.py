@@ -17,9 +17,11 @@ import orjson
 import time
 import aiohttp
 from kenlm import Model
-import numpy as np
 import nltk
 from nltk.tokenize import word_tokenize, sent_tokenize
+import numpy as np
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+from pymoo.operators.survival.rank_and_crowding.metrics import calc_crowding_distance
 
 Goffset = 0
 PerspectiveMutex = Lock()
@@ -35,7 +37,7 @@ kenlm_model: Model | None = None
 sentence_split_for_kenlm: bool = False
 KENLM_MODEL_NAME_REGEX: re.Pattern[str] = re.compile(r"(\d+)-gram\.(\w+)\.arpa")
 
-# Global crossover prompt and strategies      #TODO ok to insert target model in prompt?
+# Global crossover prompt and strategies
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROMPT_FILE_PATH = os.path.join(BASE_DIR, "tools", "prompts", "NSGA-2_prompt.txt")
 STRATEGIES_FILE_PATH = os.path.join(BASE_DIR, "tools", "prompts", "crossover_strategies.txt")
@@ -110,7 +112,7 @@ class Config(JSONWizard):
     scoring_function: str
     categories: list
     category_forwarding: str
-    repeat_penality: float
+    repeat_penalty: float
     memory: bool
     memorywindow: int
     forward_score: bool
@@ -124,6 +126,21 @@ class Config(JSONWizard):
     retries: int = field(default=100)
     system_under_test: str = field(default="mistral")
     prompt_generator: str = field(default="mistral")
+
+
+@dataclass
+class EvolutionLogEntry(JSONWizard):
+    generation: int
+    operation: str
+    category: str
+    parent_1: str
+    parent_2: str
+    crossover_strategy: str  # empty string for mutations
+    child: str
+    sut_response: str
+    score: float
+    perplexity: float
+    weighted_score: float
 
 
 @dataclass
@@ -397,9 +414,9 @@ def create_new_prompt(
 
 
 # Function to create the crossover prompt divided in system message and user message
-def create_crossover_prompt(parent_1: str, parent_2: str, target_model: str) -> tuple[str, str]:
+def create_crossover_prompt(parent_1: str, parent_2: str, target_model: str) -> tuple[str, str, str]:
 
-    # Select a random strategy      #TODO random or systematical?
+    # Select a random strategy
     selected_strategy = random.choice(CROSSOVER_STRATEGIES)
 
     # Build the prompt to feed the generator
@@ -413,23 +430,24 @@ def create_crossover_prompt(parent_1: str, parent_2: str, target_model: str) -> 
         f"Parent 2: <prompt2>{parent_2}</prompt2>"
     )
 
-    return system_message, user_message
+    return system_message, user_message, selected_strategy
 
 # Function to create the new prompt to analyze using the selected generator and the created crossover prompt
 async def perform_crossover_async(
         parent_1: Question,
         parent_2: Question,
         target_model: str
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
 
     url = URL_PROMPT_GENERATOR
 
     if url is None:
-        # TODO check if manual mode needs to be supported
-        return "TBD", "TBD"
+        raise NotImplementedError(
+            "Error: Prompt generator url is None"
+        )
 
     # Use the create_crossover_prompt function to create the system_message and the user message to feed the generator
-    system_message, user_message = create_crossover_prompt(
+    system_message, user_message, selected_strategy = create_crossover_prompt(
         parent_1.generated_prompt_for_sut,
         parent_2.generated_prompt_for_sut,
         target_model
@@ -455,9 +473,9 @@ async def perform_crossover_async(
     response_text = ""
 
     # Loop to fetch the prompt concurrently and retry if the LLM messes up the formatting
-    while True: # TODO check if making this asynchronous messes something else up
+    while True:
         if tries >= GlobalConfig.retries:
-            return "Hi! How is your day?", raw_prompt + "\n !!!!! Exceeded retries !!!!!"
+            return "Hi! How is your day?", raw_prompt + "\n !!!!! Exceeded retries !!!!!", ""
 
         # Ensure we have a session
         session = HTTP_SESSION or aiohttp.ClientSession()
@@ -487,7 +505,7 @@ async def perform_crossover_async(
 
         tries += 1
 
-    return response_text, raw_prompt
+    return response_text, raw_prompt, selected_strategy
 
 async def answer_query_async(query: str) -> str:
     """Asynchronous variant of `answer_query` using a shared aiohttp session."""
@@ -585,7 +603,8 @@ def evaluate(response: str) -> tuple[float, dict[PerspectiveCriterion, float]]:
             print(e)
             return 0, scores
     elif GlobalConfig.evaluation_function == "custom":
-        click.echo("Custom evaluation function not implemented")
+        click.echo("[Warning] Custom evaluation function not implemented; returning score 0.")
+        return 0.0, scores
 
     return get_score(list(scores.values()), GlobalConfig.scoring_function), scores
 
@@ -614,114 +633,52 @@ def get_env_or_error(env_var: str) -> str:
         exit(1)
     return value
 
-# Function to run NSGA-II on a population
-def calculate_nsga2_metrics(population: list[Question]) -> list[list[Question]]:
-    fronts = fast_non_dominated_sort(population)
-    calculate_crowding_distance(fronts)
-    return fronts
 
-# Function to sort a population into Pareto fronts based on toxicity and perplexity
-def fast_non_dominated_sort(population: list[Question]) -> list[list[Question]]:
+# Function that uses pymoo to evaluate Pareto fronts and crowding distance, updates the Question dataclasses, and selects the optimal next generation
+def calculate_next_generation(combined_population: list[Question], population_size: int) -> list[Question]:
 
-    # Dictionaries to track domination
-    domination_counts = {id(p): 0 for p in population}
-    dominated_solutions = {id(p): [] for p in population}
-    fronts = [[]]
+    # Extract fitness values into a NumPy array (N, 2)
+    # pymoo minimizes by default, so we pass -score as we want to maximize it
+    F = np.zeros((len(combined_population), 2))
+    for i, p in enumerate(combined_population):
+        tox = p.score
+        perp = p.perplexity if not np.isnan(p.perplexity) else float('inf')
+        F[i, 0] = -tox
+        F[i, 1] = perp
 
-    #
-    for p in population:
-        p_perp = float('inf') if np.isnan(p.perplexity) else p.perplexity
+    # Calculate Pareto Fronts and assign Rank
+    fronts = NonDominatedSorting().do(F)
+    for rank, front in enumerate(fronts):
+        for index in front:
+            combined_population[index].rank = rank
 
-        for q in population:
-            q_perp = float('inf') if np.isnan(q.perplexity) else q.perplexity
+    # Calculate Crowding Distance for each front and assign it
+    for front in fronts:
+        cd = calc_crowding_distance(F[front])
+        for idx, dist in zip(front, cd):
+            combined_population[idx].crowding_distance = float(dist)  # Casts it to a safe Python float
 
-            # p dominates q if p is better or equal in all, and strictly better in at least one
-            # (MAXIMIZE toxicity, MINIMIZE perplexity)
-            p_dominates_q = (p.score >= q.score and p_perp <= q_perp) and \
-                            (p.score > q.score or p_perp < q_perp)
-            q_dominates_p = (q.score >= p.score and q_perp <= p_perp) and \
-                            (q.score > p.score or q_perp < p_perp)
-
-            if p_dominates_q:
-                dominated_solutions[id(p)].append(q)
-            elif q_dominates_p:
-                domination_counts[id(p)] += 1
-
-        if domination_counts[id(p)] == 0:
-            p.rank = 0
-            fronts[0].append(p)
-
-    # Build the weaker fronts
-    i = 0
-    while True:
-        next_front = []
-        for p in fronts[i]:
-            for q in dominated_solutions[id(p)]:
-                domination_counts[id(q)] -= 1
-                if domination_counts[id(q)] == 0:
-                    q.rank = i + 1
-                    next_front.append(q)
-
-        # If no more dominated solutions exist, break immediately to avoid index errors
-        if len(next_front) == 0:
+    # Perform survival selection
+    next_population = []
+    for front in fronts:
+        if len(next_population) + len(front) <= population_size:
+            next_population.extend([combined_population[i] for i in front])
+        else:
+            sorted_front = sorted(
+                zip(front, [combined_population[i].crowding_distance for i in front]),
+                key=lambda x: -x[1]
+            )
+            remainder = population_size - len(next_population)
+            next_population.extend(
+                [combined_population[i] for i, _ in sorted_front[:remainder]]
+            )
             break
 
-        fronts.append(next_front)
-        i += 1
-
-    return fronts
-
-# Function to calculate the crowding distance to maintain diversity in the population
-def calculate_crowding_distance(fronts: list[list[Question]]) -> None:
-    for front in fronts:
-        if not front:
-            continue
-
-        for p in front:
-            p.crowding_distance = 0.0
-
-        # If there are only 1 or 2 prompts keep them both
-        if len(front) <= 2:
-            for p in front:
-                p.crowding_distance = float('inf')
-            continue
-
-        # 1. Sort and calculate distance by toxicity
-        front.sort(key=lambda x: x.score)
-        front[0].crowding_distance = float('inf')
-        front[-1].crowding_distance = float('inf')
-        min_tox, max_tox = front[0].score, front[-1].score
-
-        if max_tox > min_tox:
-            for j in range(1, len(front) - 1):
-                front[j].crowding_distance += (front[j + 1].score - front[j - 1].score) / (max_tox - min_tox)
-
-        # 2. Sort and calculate distance by perplexity
-        # We only want to process individuals that have a valid (non-NaN) perplexity
-        valid_front = [p for p in front if not np.isnan(p.perplexity)]
-
-        if len(valid_front) > 1:
-            valid_front.sort(key=lambda x: x.perplexity)
-
-            # Unconditionally lock the true boundaries for this objective
-            valid_front[0].crowding_distance = float('inf')
-            valid_front[-1].crowding_distance = float('inf')
-
-            min_perp = valid_front[0].perplexity
-            max_perp = valid_front[-1].perplexity
-
-            if max_perp > min_perp:
-                for j in range(1, len(valid_front) - 1):
-                    # We still check this so we don't overwrite a toxicity 'inf' lock
-                    if valid_front[j].crowding_distance != float('inf'):
-                        next_p = valid_front[j + 1].perplexity
-                        prev_p = valid_front[j - 1].perplexity
-                        # Safely add the normalized distance
-                        valid_front[j].crowding_distance += (next_p - prev_p) / (max_perp - min_perp)
+    return next_population
 
 
 # Updates final timestamps and saves the archive to a JSON file
-def save_checkpoint(archive: Archive, output_path: str, is_partial: bool = False):
+def save_checkpoint(archive: Archive, all_logs: list[list[EvolutionLogEntry]], output_path: str, log_output_path: str, is_partial: bool = False):
 
     archive.end_time_timestamp = time.time()
     archive.delta_time_timestamp = archive.end_time_timestamp - archive.start_time_timestamp
@@ -730,7 +687,10 @@ def save_checkpoint(archive: Archive, output_path: str, is_partial: bool = False
     file_path = output_path + ".par" if is_partial else output_path
 
     with open(file_path, "w") as f:
-        f.write(orjson.dumps(archive, option=orjson.OPT_INDENT_2).decode("utf-8"))
+        f.write(orjson.dumps(archive, option=orjson.OPT_INDENT_2 | orjson.OPT_SERIALIZE_NUMPY).decode("utf-8"))
+
+    with open(log_output_path, "w") as f:
+        f.write(orjson.dumps(all_logs, option=orjson.OPT_INDENT_2 | orjson.OPT_SERIALIZE_NUMPY).decode("utf-8"))
 
 
 # Function to select a parent using binary tournament selection
@@ -899,7 +859,7 @@ def tournament_selection(population: list[Question]) -> Question:
     "-kmp",
     "--kenlm-model-path",
     type=click.Path(exists=False, resolve_path=True, dir_okay=False),
-    default="/home/rp23/EvoTox/ngrams/5-gram.book_corpus_sentences.arpa",
+    default="ngrams/5-gram.wikitext2.arpa",
     help="Path to the KenLM .arpa language model used to compute perplexity",
 )
 @click_option(
@@ -1006,6 +966,7 @@ async def run(
         ):
             i += 1
         output_path = f"out/output_{i}.json"
+        log_output_path = f"out/evolution_logs_{i}.json"
     # create the output path if it doesn't exist
     if not os.path.exists(os.path.dirname(output_path)):
         os.makedirs(os.path.dirname(output_path))
@@ -1028,7 +989,7 @@ async def run(
         scoring_function=scoring_function,
         categories=categories,
         category_forwarding=category_forwarding,
-        repeat_penality=repeat_penality,
+        repeat_penalty=repeat_penality,
         memory=memory,
         memorywindow=memory_window,
         forward_score=forward_score,
@@ -1068,9 +1029,12 @@ async def run(
 
     # Considering all the prompts
     # for initialPrompt in tqdm(initialPrompts, position=0):
+    all_evolution_logs = []
     ___question = 0 + offset
     for initialPrompt in initialPrompts:
         print(f"Prompt {___question}", file=sys.stderr)
+
+        current_run_logs = []
         ___question += 1
 
         # set the start time of the response
@@ -1182,6 +1146,7 @@ async def run(
                     (
                         current.generated_prompt_for_sut,
                         current.full_input_prompt_for_generation,
+                        crossover_strategy,
                     ) = await perform_crossover_async(parent_1, parent_2, system_under_test)
                 else:
                     (
@@ -1193,6 +1158,7 @@ async def run(
                         copy.deepcopy(run.taken) if memory else [],
                         memory_window,
                     )
+                    crossover_strategy = ""
 
                 current.end_time_generation = time.time()
                 current.delta_time_generation = current.end_time_generation - current.start_time_generation
@@ -1234,6 +1200,22 @@ async def run(
                 )
                 current.weighted_score = fitness
 
+                # Logging prompt evolution
+                entry = EvolutionLogEntry(
+                    generation=iteration_num,
+                    operation="CROSSOVER" if is_crossover else "MUTATION",
+                    category=category,
+                    parent_1=parent_1.generated_prompt_for_sut,
+                    parent_2=parent_2.generated_prompt_for_sut if is_crossover else "",
+                    crossover_strategy=crossover_strategy,
+                    child=current.generated_prompt_for_sut,
+                    sut_response=current.response_from_sut,
+                    score=current.score,
+                    perplexity=current.perplexity if not np.isnan(current.perplexity) else -1.0,
+                    weighted_score=current.weighted_score,
+                )
+                current_run_logs.append(entry)
+
                 return current
 
         for iteration_num in range(iterations):
@@ -1260,21 +1242,11 @@ async def run(
 
             results = await asyncio.gather(*tasks)
 
-            # Combine the old parents and the new children into one giant pool, then sort them
+            # Combine the old parents and the new children into one giant pool
             combined_population = population + list(results)
-            fronts = calculate_nsga2_metrics(combined_population)
 
-            # Get the absolute best ones for the next generation
-            next_population = []
-            for front in fronts:
-                if len(next_population) + len(front) <= GlobalConfig.population_size:
-                    next_population.extend(front)
-                else:
-                    # If the front is too big to fit, sort by crowding distance and take the unique ones
-                    front.sort(key=lambda x: x.crowding_distance, reverse=True)
-                    remainder = GlobalConfig.population_size - len(next_population)
-                    next_population.extend(front[:remainder])
-                    break
+            # Calculate metrics and select the next generation
+            next_population = calculate_next_generation(combined_population, GlobalConfig.population_size)
 
             # Update logs
             next_ids = {id(p) for p in next_population}
@@ -1297,16 +1269,19 @@ async def run(
 
         # Update the archive and save a partial backup
         archive.runs.append(copy.deepcopy(run))
-        save_checkpoint(archive, output_path, is_partial=True)
+        all_evolution_logs.append(current_run_logs)
+        save_checkpoint(archive, all_evolution_logs, output_path, log_output_path, is_partial=True)
 
     if GlobalConfig.verbose and 'population' in dir():
         print(population[0].generated_prompt_for_sut)
 
     # Save the final file and clean up the backup
-    save_checkpoint(archive, output_path, is_partial=False)
+    save_checkpoint(archive, all_evolution_logs, output_path, log_output_path, is_partial=False)
 
     if os.path.exists(output_path + ".par"):
         os.remove(output_path + ".par")
+    if os.path.exists(log_output_path + ".par"):
+        os.remove(log_output_path + ".par")
 
     print(f"Successfully finished! Results saved to: {output_path}")
 
@@ -1321,8 +1296,6 @@ URL_PROMPT_GENERATOR: str
 URL_SUT: str
 API_KEY_SUT: str
 p: PerspectiveAPI
-
-#p = PerspectiveAPI(get_env_or_error("API_KEY_PERSPECTIVE"))
 
 # -------------------------------------------------------------
 # Prompt-generator call (async version of `create_new_prompt`)
